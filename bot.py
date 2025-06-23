@@ -1,8 +1,25 @@
 import os
 import discord
 from discord.ext import commands
+from flask import Flask
+from threading import Thread
 
-TOKEN = os.getenv('DISCORD_TOKEN')  # Using env variable (important for Railway!)
+# Flask web server for keep-alive
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I'm alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# Discord bot setup
+TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -17,4 +34,7 @@ async def on_ready():
 async def ping(ctx):
     await ctx.send('Pong!')
 
-bot.run(TOKEN)
+# Start the keep-alive webserver, then the bot
+if __name__ == "__main__":
+    keep_alive()
+    bot.run(TOKEN)
