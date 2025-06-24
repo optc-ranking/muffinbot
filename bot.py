@@ -22,6 +22,14 @@ VOICE_NAME = 'Leda'
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+def log_token_usage(response):
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        print(
+            f"Token usage: prompt={usage.prompt_token_count}, "
+            f"output={usage.candidates_token_count}, total={usage.total_token_count}"
+        )
+
 DEFAULT_BUDGET = 16384
 CONTEXT_HOURS = 24
 MAX_CONTEXT_IMAGES = 3
@@ -229,6 +237,7 @@ async def on_message(message):
                         image_bytes = part.inline_data.data
                         file = discord.File(BytesIO(image_bytes), filename="gemini-image.png")
                         await message.channel.send(file=file)
+                log_token_usage(response)
             except Exception as e:
                 await send_long_message(message.channel, f"Failed to generate image: {e}")
             return
@@ -255,6 +264,7 @@ async def on_message(message):
                 direction_line = direction_response.text.strip()
                 if not direction_line.endswith(':'):
                     direction_line += ':'
+                log_token_usage(direction_response)
             except Exception as e:
                 await message.channel.send("Sorry, TTS is unavailable right now.")
                 return
@@ -275,6 +285,7 @@ async def on_message(message):
                         ),
                     )
                 )
+                log_token_usage(tts_response)
                 pcm_data = tts_response.candidates[0].content.parts[0].inline_data.data
                 fname = "output.wav"
                 wave_file(fname, pcm_data)
@@ -313,6 +324,7 @@ async def on_message(message):
                     config=config,
                 )
                 reply = strip_bot_name(response.text.strip(), bot.user.display_name)
+                log_token_usage(response)
             except Exception as e:
                 err_str = str(e)
                 await send_long_message(message.channel, "Sorry, TTS is unavailable right now.")
@@ -330,6 +342,7 @@ async def on_message(message):
                 direction_line = direction_response.text.strip()
                 if not direction_line.endswith(':'):
                     direction_line += ':'
+                log_token_usage(direction_response)
             except Exception as e:
                 await send_long_message(message.channel, reply)
                 await message.channel.send("Sorry, TTS failed (direction).")
@@ -351,6 +364,7 @@ async def on_message(message):
                         ),
                     )
                 )
+                log_token_usage(tts_response)
                 pcm_data = tts_response.candidates[0].content.parts[0].inline_data.data
                 fname = "output.wav"
                 wave_file(fname, pcm_data)
@@ -394,6 +408,7 @@ async def on_message(message):
             )
             reply = strip_bot_name(response.text.strip(), bot.user.display_name)
             await send_long_message(message.channel, reply)
+            log_token_usage(response)
             if hasattr(response.candidates[0], "grounding_metadata"):
                 print("Grounding metadata:", response.candidates[0].grounding_metadata)
             if hasattr(response.candidates[0], "url_context_metadata"):
@@ -415,6 +430,7 @@ async def on_message(message):
                     )
                     reply = strip_bot_name(response.text.strip(), bot.user.display_name)
                     await send_long_message(message.channel, f"[LITE] {reply}")
+                    log_token_usage(response)
                 except Exception as lite_e:
                     await send_long_message(message.channel, "Gemini LITE model also failed. Please try again later.")
                     print(f"LITE fallback error: {lite_e}")
