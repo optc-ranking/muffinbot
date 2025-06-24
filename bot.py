@@ -6,7 +6,6 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 import re
-from PIL import Image
 from io import BytesIO
 import wave
 
@@ -67,22 +66,31 @@ def strip_bot_name(text, bot_name):
 
 async def collect_context(channel, current_message, bot_user):
     after_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=CONTEXT_HOURS)
-    context_messages = []
+    messages = []
     async for msg in channel.history(limit=100, after=after_time, oldest_first=True):
         if msg.id == current_message.id or not msg.clean_content:
             continue
+        messages.append(msg)
+
+    context_messages = [None] * len(messages)
+    images_used = 0
+
+    for idx, msg in enumerate(reversed(messages)):
         role = "model" if msg.author == bot_user else "user"
-        # MULTIMODAL CONTEXT: Attach image parts if present
         parts = []
         if msg.clean_content:
             parts.append({"text": msg.clean_content})
-        for attachment in msg.attachments:
-            if attachment.content_type and attachment.content_type.startswith("image/"):
-                image_bytes = await download_attachment(attachment)
-                parts.append(types.Part.from_bytes(data=image_bytes, mime_type=attachment.content_type))
-        if parts:
-            context_messages.append({"role": role, "parts": parts})
-    return context_messages  # In chronological order
+        if images_used < MAX_CONTEXT_IMAGES:
+            for attachment in msg.attachments:
+                if attachment.content_type and attachment.content_type.startswith("image/"):
+                    if images_used >= MAX_CONTEXT_IMAGES:
+                        break
+                    image_bytes = await download_attachment(attachment)
+                    parts.append(types.Part.from_bytes(data=image_bytes, mime_type=attachment.content_type))
+                    images_used += 1
+        context_messages[len(messages) - 1 - idx] = {"role": role, "parts": parts}
+
+    return [msg for msg in context_messages if msg]  # In chronological order
 
 def wave_file(filename, pcm, channels=1, rate=24000, sample_width=2):
     with wave.open(filename, "wb") as wf:
