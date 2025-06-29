@@ -32,6 +32,20 @@ def log_token_usage(response):
             f"output={usage.candidates_token_count}, total={usage.total_token_count}"
         )
 
+def extract_json(text):
+    """Extract JSON object from a string."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return None
+
 DEFAULT_BUDGET = 16384
 CONTEXT_HOURS = 24
 MAX_CONTEXT_IMAGES = 3
@@ -128,11 +142,11 @@ async def decide_reply_ids(pairs):
             contents=decision_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=ASSISTANT_SYSTEM_PROMPT,
-                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET),
+                thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET),
             ),
         )
         log_token_usage(response)
-        ids = json.loads(response.text.strip())
+        ids = extract_json(response.text)
         if isinstance(ids, list):
             selected_ids = [int(i) for i in ids]
         else:
@@ -149,7 +163,7 @@ async def decide_reply_ids(pairs):
                 ),
             )
             log_token_usage(response)
-            ids = json.loads(response.text.strip())
+            ids = extract_json(response.text)
             if isinstance(ids, list):
                 selected_ids = [int(i) for i in ids]
             else:
@@ -204,7 +218,7 @@ async def generate_replies(context_messages, ids, pairs, used_tools, thinking, i
                 config=alt_config,
             )
             log_token_usage(response)
-            data = json.loads(response.text.strip())
+            data = extract_json(response.text)
             if isinstance(data, dict):
                 replies = data.get("responses", [])
                 if prefix:
@@ -484,7 +498,7 @@ async def on_message(message):
             config = types.GenerateContentConfig(
                 system_instruction=BOT_SYSTEM_PROMPT,
                 tools=used_tools,
-                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET)
+                thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET)
             )
             try:
                 response = await asyncio.to_thread(
