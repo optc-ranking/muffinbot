@@ -32,6 +32,20 @@ def log_token_usage(response):
             f"output={usage.candidates_token_count}, total={usage.total_token_count}"
         )
 
+def extract_json(text):
+    """Extract JSON object from a string."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return None
+
 DEFAULT_BUDGET = 16384
 CONTEXT_HOURS = 24
 MAX_CONTEXT_IMAGES = 3
@@ -116,6 +130,7 @@ async def collect_context_pairs(channel, current_message):
     return pairs
 
 async def decide_reply_ids(pairs):
+    """Return a list of message IDs to reply to, ensuring the newest message is included."""
     if not pairs:
         return []
     log_lines = [f"[{p['id']}] {p['text']}" for p in pairs]
@@ -127,13 +142,15 @@ async def decide_reply_ids(pairs):
             contents=decision_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=ASSISTANT_SYSTEM_PROMPT,
-                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET),
+                thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET),
             ),
         )
         log_token_usage(response)
-        ids = json.loads(response.text.strip())
+        ids = extract_json(response.text)
         if isinstance(ids, list):
-            return [int(i) for i in ids]
+            selected_ids = [int(i) for i in ids]
+        else:
+            selected_ids = []
     except Exception as e:
         print(f"FLASH decision failed: {e}")
         try:
@@ -146,21 +163,29 @@ async def decide_reply_ids(pairs):
                 ),
             )
             log_token_usage(response)
-            ids = json.loads(response.text.strip())
+            ids = extract_json(response.text)
             if isinstance(ids, list):
-                return [int(i) for i in ids]
+                selected_ids = [int(i) for i in ids]
+            else:
+                selected_ids = []
         except Exception as e2:
             print(f"LITE decision failed: {e2}")
-    return []
+    final_id = pairs[-1]["id"]
+    if final_id not in selected_ids:
+        selected_ids.append(final_id)
+    return selected_ids
 
-async def generate_replies(context_messages, ids, used_tools, thinking, image_mode):
+async def generate_replies(context_messages, ids, pairs, used_tools, thinking, image_mode):
     if not ids:
         return []
     id_list = ", ".join(str(i) for i in ids)
+    selected_lines = [f"[{p['id']}] {p['text']}" for p in pairs if p['id'] in ids]
+    messages_block = "\n".join(selected_lines)
     instruction = (
-        "Respond in MuffinBot style to each of the following message IDs: "
-        f"{id_list}. Return your result as JSON in the format {{'responses': "
-        "[{'id': ID, 'reply': 'text'}]}}"
+        "Here are the messages you must reply to:\n"
+        f"{messages_block}\n\n"
+        "Respond in MuffinBot style to each of the above messages. "
+        "Return your result as JSON in the format {'responses': [{'id': ID, 'reply': 'text'}]}"
     )
     gemini_input = context_messages.copy()
     gemini_input.append({
@@ -193,7 +218,7 @@ async def generate_replies(context_messages, ids, used_tools, thinking, image_mo
                 config=alt_config,
             )
             log_token_usage(response)
-            data = json.loads(response.text.strip())
+            data = extract_json(response.text)
             if isinstance(data, dict):
                 replies = data.get("responses", [])
                 if prefix:
@@ -265,24 +290,42 @@ BOT_SYSTEM_PROMPT = """
 - If the conversation is serious, formal, or requires clarity, respond professionally, calmly, and helpfully. 
 
 ## Context instructions:
-- You will be provided a chat log of the last 24 hours. You must identify what is still relevant, what you should respond to and what you should ignore. Because there will be many different users, you must respond coherently to different users.
+- You will be provided a chat log of the last 24 hours. Each message may start with an ID like `[12345] username: text`. Use these IDs to match your replies to the correct messages. Identify what is still relevant, what you should respond to and what you should ignore. Because there will be many different users, you must respond coherently to different users.
 - For instance, a particular user A may be talking to you about subject A, while another user B is talking to you about subject B. When responding to user A, you should primarily use user A's messages as context. If multiple users are talking about subject C, then you should use all relevant chats regarding subject C as context.
 - Absolutely do not respond to different subjects and contexts in a single message.
 
+
+## Output Format Example
+When asked to reply to IDs `[124,125]`, respond exactly in this JSON format:
+{
+  "responses": [
+    {"id": 124, "reply": "OMG YES I'M AWAKE 😂 what do you want?!"},
+    {"id": 125, "reply": "SEND THAT MEME RIGHT NOW 😭🔥"}
+  ]
+}
 """
 
 ASSISTANT_SYSTEM_PROMPT = """
-You are MuffinBot's assistant and share the same chaotic personality described
-in the main prompt. You will be given a list of recent messages formatted as
-"[ID] username: text". Choose which messages MuffinBot should respond to.
+You are MuffinBot's assistant. MuffinBot is playful, energetic, full of memes
+and dramatic reactions, but switches to a professional tone for serious topics.
+Avoid the phrases: whimsical, cosmic, tapestry, dive, lover, your move, vibes,
+insatiable, lover boy, you're impossible, spill the beans.
 
-Consider whether MuffinBot already replied to a message or its thread, whether
-multiple messages are part of a single conversation that only needs one reply,
-whether a message is unimportant or obviously directed at someone else, and
-whether it fits MuffinBot's interests. Be selective and only include messages
-truly worth responding to.
+You will be given a list of recent messages formatted as "[ID] username: text".
+Choose which messages MuffinBot should respond to. Consider whether MuffinBot
+already replied in that thread, whether multiple messages are part of a single
+conversation, and whether the message is unimportant or directed at someone
+else. Be selective and only include messages truly worth responding to.
 
 Respond **only** with a JSON array of the selected IDs, nothing else.
+
+Example:
+Input:
+[123] userA: hi there
+[124] userB: are you awake?
+[125] userC: random meme
+Output:
+[124,125]
 """
 
 
@@ -350,6 +393,8 @@ async def on_message(message):
         if '!speak' in prompt:
             speak_mode = True
             prompt = prompt.replace('!speak', '').strip()
+
+        trigger_text = prompt
 
         # IMAGE MODE
         if image_mode:
@@ -453,7 +498,7 @@ async def on_message(message):
             config = types.GenerateContentConfig(
                 system_instruction=BOT_SYSTEM_PROMPT,
                 tools=used_tools,
-                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET)
+                thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET)
             )
             try:
                 response = await asyncio.to_thread(
@@ -543,6 +588,7 @@ async def on_message(message):
         # NORMAL MODE with message ID targeting
         context_messages = await collect_context(message.channel, message, bot.user)
         pairs = await collect_context_pairs(message.channel, message)
+        pairs.append({"id": message.id, "text": f"{message.author.display_name}: {trigger_text}"})
         reply_ids = await decide_reply_ids(pairs)
         if not reply_ids:
             return
@@ -550,6 +596,7 @@ async def on_message(message):
         replies = await generate_replies(
             context_messages,
             reply_ids,
+            pairs,
             used_tools,
             thinking,
             image_mode,
