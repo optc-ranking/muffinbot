@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 import re
+import json
 from io import BytesIO
 import wave
 
@@ -101,6 +102,123 @@ async def collect_context(channel, current_message, bot_user):
 
     return [msg for msg in context_messages if msg]  # In chronological order
 
+async def collect_context_pairs(channel, current_message):
+    after_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=CONTEXT_HOURS)
+    pairs = []
+    async for msg in channel.history(limit=100, after=after_time, oldest_first=True):
+        if msg.id == current_message.id or not msg.clean_content:
+            continue
+        entry = {
+            "id": msg.id,
+            "text": f"{msg.author.display_name}: {msg.clean_content}"
+        }
+        pairs.append(entry)
+    return pairs
+
+async def decide_reply_ids(pairs):
+    if not pairs:
+        return []
+    log_lines = [f"[{p['id']}] {p['text']}" for p in pairs]
+    decision_prompt = "\n".join(log_lines)
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_FLASH_MODEL,
+            contents=decision_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=ASSISTANT_SYSTEM_PROMPT,
+                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET),
+            ),
+        )
+        log_token_usage(response)
+        ids = json.loads(response.text.strip())
+        if isinstance(ids, list):
+            return [int(i) for i in ids]
+    except Exception as e:
+        print(f"FLASH decision failed: {e}")
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=GEMINI_LITE_MODEL,
+                contents=decision_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=ASSISTANT_SYSTEM_PROMPT,
+                ),
+            )
+            log_token_usage(response)
+            ids = json.loads(response.text.strip())
+            if isinstance(ids, list):
+                return [int(i) for i in ids]
+        except Exception as e2:
+            print(f"LITE decision failed: {e2}")
+    return []
+
+async def generate_replies(context_messages, ids, used_tools, thinking, image_mode):
+    if not ids:
+        return []
+    id_list = ", ".join(str(i) for i in ids)
+    instruction = (
+        "Respond in MuffinBot style to each of the following message IDs: "
+        f"{id_list}. Return your result as JSON in the format {{'responses': "
+        "[{'id': ID, 'reply': 'text'}]}}"
+    )
+    gemini_input = context_messages.copy()
+    gemini_input.append({
+        "role": "user",
+        "parts": [{"text": instruction}],
+    })
+    config = types.GenerateContentConfig(
+        system_instruction=BOT_SYSTEM_PROMPT,
+        tools=used_tools,
+        thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET) if (thinking and not image_mode) else None,
+    )
+    models = [
+        (GEMINI_PRO_MODEL, ""),
+        (GEMINI_FLASH_MODEL, "[FLASH] "),
+        (GEMINI_LITE_MODEL, "[LITE] "),
+    ]
+    for model_name, prefix in models:
+        try:
+            alt_config = config
+            if model_name == GEMINI_LITE_MODEL and config.thinking_config:
+                alt_config = types.GenerateContentConfig(
+                    system_instruction=BOT_SYSTEM_PROMPT,
+                    tools=used_tools,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0) if not image_mode else None,
+                )
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=model_name,
+                contents=gemini_input,
+                config=alt_config,
+            )
+            log_token_usage(response)
+            data = json.loads(response.text.strip())
+            if isinstance(data, dict):
+                replies = data.get("responses", [])
+                if prefix:
+                    for item in replies:
+                        if "reply" in item:
+                            item["reply"] = prefix + item["reply"]
+                return replies
+        except Exception as e:
+            print(f"{model_name} reply failed: {e}")
+    return []
+
+async def send_replies(channel, replies):
+    for item in replies:
+        text = item.get("reply")
+        msg_id = item.get("id")
+        if not text or not msg_id:
+            continue
+        ref = None
+        try:
+            ref = await channel.fetch_message(int(msg_id))
+        except Exception as e:
+            print(f"Could not fetch message {msg_id}: {e}")
+        for chunk in split_long_message(text):
+            await channel.send(chunk, reference=ref)
+
 def wave_file(filename, pcm, channels=1, rate=24000, sample_width=2):
     with wave.open(filename, "wb") as wf:
         wf.setnchannels(channels)
@@ -112,7 +230,7 @@ google_search_tool = types.Tool(google_search=types.GoogleSearch())
 url_context_tool = types.Tool(url_context=types.UrlContext())
 TOOLS = [google_search_tool, url_context_tool]
 
-SYSTEM_PROMPT = """
+BOT_SYSTEM_PROMPT = """
 ## Functionality
 
 - Use web search for any query about current events, news, trending topics, or information that may change over time. If you use search, always include direct clickable links in your response.
@@ -151,6 +269,20 @@ SYSTEM_PROMPT = """
 - For instance, a particular user A may be talking to you about subject A, while another user B is talking to you about subject B. When responding to user A, you should primarily use user A's messages as context. If multiple users are talking about subject C, then you should use all relevant chats regarding subject C as context.
 - Absolutely do not respond to different subjects and contexts in a single message.
 
+"""
+
+ASSISTANT_SYSTEM_PROMPT = """
+You are MuffinBot's assistant and share the same chaotic personality described
+in the main prompt. You will be given a list of recent messages formatted as
+"[ID] username: text". Choose which messages MuffinBot should respond to.
+
+Consider whether MuffinBot already replied to a message or its thread, whether
+multiple messages are part of a single conversation that only needs one reply,
+whether a message is unimportant or obviously directed at someone else, and
+whether it fits MuffinBot's interests. Be selective and only include messages
+truly worth responding to.
+
+Respond **only** with a JSON array of the selected IDs, nothing else.
 """
 
 
@@ -319,7 +451,7 @@ async def on_message(message):
             })
             used_tools = TOOLS if search_mode else []
             config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=BOT_SYSTEM_PROMPT,
                 tools=used_tools,
                 thinking_config=types.ThinkingConfig(DEFAULT_BUDGET)
             )
@@ -334,7 +466,7 @@ async def on_message(message):
                 log_token_usage(response)
             except Exception as e:
                 err_str = str(e)
-                # fallback to flash
+                # fallback to flash then lite
                 try:
                     response = await asyncio.to_thread(
                         client.models.generate_content,
@@ -345,8 +477,23 @@ async def on_message(message):
                     reply = "[FLASH] " + strip_bot_name(response.text.strip(), bot.user.display_name)
                     log_token_usage(response)
                 except Exception as e2:
-                    await send_long_message(message.channel, "Sorry, TTS is unavailable right now.")
-                    return
+                    try:
+                        lite_config = types.GenerateContentConfig(
+                            system_instruction=BOT_SYSTEM_PROMPT,
+                            tools=used_tools,
+                            thinking_config=types.ThinkingConfig(thinking_budget=0)
+                        )
+                        response = await asyncio.to_thread(
+                            client.models.generate_content,
+                            model=GEMINI_LITE_MODEL,
+                            contents=gemini_input,
+                            config=lite_config,
+                        )
+                        reply = "[LITE] " + strip_bot_name(response.text.strip(), bot.user.display_name)
+                        log_token_usage(response)
+                    except Exception:
+                        await send_long_message(message.channel, "Sorry, TTS is unavailable right now.")
+                        return
             direction_prompt = f"Given the following Discord message, write a single line direction (e.g. 'Say dramatically:' or 'Say in a deadpan voice:') for how it should be spoken out loud, based on its vibe/context. The line should be suitable to prepend before the text for TTS.\n\nMessage: {reply}"
             try:
                 direction_response = await asyncio.to_thread(
@@ -393,79 +540,21 @@ async def on_message(message):
                 await message.channel.send("Sorry, TTS failed. [No audio]")
             return
 
-        # NORMAL MODE (multi-turn, multi-modal context!) -- try PRO, then FLASH, then LITE
+        # NORMAL MODE with message ID targeting
         context_messages = await collect_context(message.channel, message, bot.user)
-        gemini_input = context_messages.copy()
-        user_parts = []
-        if prompt:
-            user_parts.append({"text": prompt})
-        if message.attachments:
-            attachment = message.attachments[0]
-            if attachment.content_type and attachment.content_type.startswith("image/"):
-                image_bytes = await download_attachment(attachment)
-                user_parts.append(types.Part.from_bytes(data=image_bytes, mime_type=attachment.content_type))
-        gemini_input.append({
-            "role": "user",
-            "parts": user_parts
-        })
-
+        pairs = await collect_context_pairs(message.channel, message)
+        reply_ids = await decide_reply_ids(pairs)
+        if not reply_ids:
+            return
         used_tools = TOOLS if search_mode else []
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=used_tools,
-            thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET)
-                if (thinking and not image_mode) else None
+        replies = await generate_replies(
+            context_messages,
+            reply_ids,
+            used_tools,
+            thinking,
+            image_mode,
         )
-        # --- PRO, then FLASH, then LITE fallback chain
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=GEMINI_PRO_MODEL,
-                contents=gemini_input,
-                config=config,
-            )
-            reply = strip_bot_name(response.text.strip(), bot.user.display_name)
-            await send_long_message(message.channel, reply)
-            log_token_usage(response)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower():
-                try:
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=GEMINI_FLASH_MODEL,
-                        contents=gemini_input,
-                        config=config,
-                    )
-                    reply = "[FLASH] " + strip_bot_name(response.text.strip(), bot.user.display_name)
-                    await send_long_message(message.channel, reply)
-                    log_token_usage(response)
-                except Exception as flash_e:
-                    err_flash = str(flash_e)
-                    if "503" in err_flash and "overloaded" in err_flash.lower():
-                        try:
-                            lite_config = types.GenerateContentConfig(
-                                system_instruction=SYSTEM_PROMPT,
-                                tools=used_tools,
-                                thinking_config=types.ThinkingConfig(thinking_budget=0) if not image_mode else None
-                            )
-                            response = await asyncio.to_thread(
-                                client.models.generate_content,
-                                model=GEMINI_LITE_MODEL,
-                                contents=gemini_input,
-                                config=lite_config,
-                            )
-                            reply = "[LITE] " + strip_bot_name(response.text.strip(), bot.user.display_name)
-                            await send_long_message(message.channel, reply)
-                            log_token_usage(response)
-                        except Exception as lite_e:
-                            await send_long_message(message.channel, "Gemini LITE model also failed. Please try again later.")
-                            print(f"LITE fallback error: {lite_e}")
-                    else:
-                        await send_long_message(message.channel, "Gemini FLASH model also failed. Please try again later.")
-                        print(f"FLASH fallback error: {flash_e}")
-            else:
-                await send_long_message(message.channel, "Sorry, the bot had an error. Please try again later.")
-                print(f"Other error: {e}")
+        if replies:
+            await send_replies(message.channel, replies)
 
 bot.run(TOKEN)
