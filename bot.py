@@ -14,7 +14,8 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))
-GEMINI_MODEL = 'gemini-2.5-flash'
+GEMINI_PRO_MODEL = 'gemini-2.5-pro'
+GEMINI_FLASH_MODEL = 'gemini-2.5-flash'
 GEMINI_LITE_MODEL = 'gemini-2.5-flash-lite-preview-06-17'
 GEMINI_IMAGE_MODEL = 'gemini-2.0-flash-preview-image-generation'
 GEMINI_TTS_MODEL = 'gemini-2.5-flash-preview-tts'
@@ -128,7 +129,7 @@ SYSTEM_PROMPT = """
 - You NEVER use the following phrases: whimsical, cosmic, tapestry, dive, lover, your move, vibes, insatiable, lover boy, you’re impossible, spill the beans.
 
 ## Texting Style Examples
-- If the conversation is casual then see these texting examples:
+- If the conversation is casual then see these texting examples (KEEP IT SHORT):
 - "GUYSSSSS WHAT IS HAPPENING 😭😭😭😭 send help omggggggg"
 - "wait wait wait did u see THAT??? I’m ACTUALLY screaming lmao 😂😂"
 - "NOOOOOOO why would u do that ur banned ✨blocked✨"
@@ -145,7 +146,13 @@ SYSTEM_PROMPT = """
 - Note how short they are - 1 liners (it's just texting)
 - If the conversation is serious, formal, or requires clarity, respond professionally, calmly, and helpfully. 
 
+## Context instructions:
+- You will be provided a chat log of the last 24 hours. You must identify what is still relevant, what you should respond to and what you should ignore. Because there will be many different users, you must respond coherently to different users.
+- For instance, a particular user A may be talking to you about subject A, while another user B is talking to you about subject B. When responding to user A, you should primarily use user A's messages as context. If multiple users are talking about subject C, then you should use all relevant chats regarding subject C as context.
+- Absolutely do not respond to different subjects and contexts in a single message.
+
 """
+
 
 @bot.event
 async def on_ready():
@@ -255,7 +262,7 @@ async def on_message(message):
             try:
                 direction_response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model=GEMINI_MODEL,
+                    model=GEMINI_FLASH_MODEL,
                     contents=direction_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction="Respond only with the single line direction for TTS, nothing else.",
@@ -314,12 +321,12 @@ async def on_message(message):
             config = types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 tools=used_tools,
-                thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET)
+                thinking_config=types.ThinkingConfig(DEFAULT_BUDGET)
             )
             try:
                 response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model=GEMINI_MODEL,
+                    model=GEMINI_PRO_MODEL,
                     contents=gemini_input,
                     config=config,
                 )
@@ -327,13 +334,24 @@ async def on_message(message):
                 log_token_usage(response)
             except Exception as e:
                 err_str = str(e)
-                await send_long_message(message.channel, "Sorry, TTS is unavailable right now.")
-                return
+                # fallback to flash
+                try:
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model=GEMINI_FLASH_MODEL,
+                        contents=gemini_input,
+                        config=config,
+                    )
+                    reply = "[FLASH] " + strip_bot_name(response.text.strip(), bot.user.display_name)
+                    log_token_usage(response)
+                except Exception as e2:
+                    await send_long_message(message.channel, "Sorry, TTS is unavailable right now.")
+                    return
             direction_prompt = f"Given the following Discord message, write a single line direction (e.g. 'Say dramatically:' or 'Say in a deadpan voice:') for how it should be spoken out loud, based on its vibe/context. The line should be suitable to prepend before the text for TTS.\n\nMessage: {reply}"
             try:
                 direction_response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model=GEMINI_MODEL,
+                    model=GEMINI_FLASH_MODEL,
                     contents=direction_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction="Respond only with the single line direction for TTS, nothing else.",
@@ -375,7 +393,7 @@ async def on_message(message):
                 await message.channel.send("Sorry, TTS failed. [No audio]")
             return
 
-        # NORMAL MODE (with multi-turn, multi-modal context!)
+        # NORMAL MODE (multi-turn, multi-modal context!) -- try PRO, then FLASH, then LITE
         context_messages = await collect_context(message.channel, message, bot.user)
         gemini_input = context_messages.copy()
         user_parts = []
@@ -392,48 +410,60 @@ async def on_message(message):
         })
 
         used_tools = TOOLS if search_mode else []
-
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             tools=used_tools,
             thinking_config=types.ThinkingConfig(thinking_budget=DEFAULT_BUDGET)
                 if (thinking and not image_mode) else None
         )
+        # --- PRO, then FLASH, then LITE fallback chain
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model=GEMINI_MODEL,
+                model=GEMINI_PRO_MODEL,
                 contents=gemini_input,
                 config=config,
             )
             reply = strip_bot_name(response.text.strip(), bot.user.display_name)
             await send_long_message(message.channel, reply)
             log_token_usage(response)
-            if hasattr(response.candidates[0], "grounding_metadata"):
-                print("Grounding metadata:", response.candidates[0].grounding_metadata)
-            if hasattr(response.candidates[0], "url_context_metadata"):
-                print("URL context metadata:", response.candidates[0].url_context_metadata)
         except Exception as e:
             err_str = str(e)
-            if "503" in err_str and "overloaded" in err_str.lower():
+            if "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower():
                 try:
-                    lite_config = types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        tools=used_tools,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0) if not image_mode else None
-                    )
                     response = await asyncio.to_thread(
                         client.models.generate_content,
-                        model=GEMINI_LITE_MODEL,
+                        model=GEMINI_FLASH_MODEL,
                         contents=gemini_input,
-                        config=lite_config,
+                        config=config,
                     )
-                    reply = strip_bot_name(response.text.strip(), bot.user.display_name)
-                    await send_long_message(message.channel, f"[LITE] {reply}")
+                    reply = "[FLASH] " + strip_bot_name(response.text.strip(), bot.user.display_name)
+                    await send_long_message(message.channel, reply)
                     log_token_usage(response)
-                except Exception as lite_e:
-                    await send_long_message(message.channel, "Gemini LITE model also failed. Please try again later.")
-                    print(f"LITE fallback error: {lite_e}")
+                except Exception as flash_e:
+                    err_flash = str(flash_e)
+                    if "503" in err_flash and "overloaded" in err_flash.lower():
+                        try:
+                            lite_config = types.GenerateContentConfig(
+                                system_instruction=SYSTEM_PROMPT,
+                                tools=used_tools,
+                                thinking_config=types.ThinkingConfig(thinking_budget=0) if not image_mode else None
+                            )
+                            response = await asyncio.to_thread(
+                                client.models.generate_content,
+                                model=GEMINI_LITE_MODEL,
+                                contents=gemini_input,
+                                config=lite_config,
+                            )
+                            reply = "[LITE] " + strip_bot_name(response.text.strip(), bot.user.display_name)
+                            await send_long_message(message.channel, reply)
+                            log_token_usage(response)
+                        except Exception as lite_e:
+                            await send_long_message(message.channel, "Gemini LITE model also failed. Please try again later.")
+                            print(f"LITE fallback error: {lite_e}")
+                    else:
+                        await send_long_message(message.channel, "Gemini FLASH model also failed. Please try again later.")
+                        print(f"FLASH fallback error: {flash_e}")
             else:
                 await send_long_message(message.channel, "Sorry, the bot had an error. Please try again later.")
                 print(f"Other error: {e}")
